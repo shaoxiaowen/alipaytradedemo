@@ -1,7 +1,11 @@
 package com.alipay.demo.qrcodetrade.service.impl;
 
+import com.alipay.api.AlipayApiException;
 import com.alipay.api.AlipayResponse;
+import com.alipay.api.domain.TradeFundBill;
+import com.alipay.api.internal.util.AlipaySignature;
 import com.alipay.api.response.AlipayTradePrecreateResponse;
+import com.alipay.api.response.AlipayTradeQueryResponse;
 import com.alipay.demo.qrcodetrade.Util.PropertiesUtil;
 import com.alipay.demo.qrcodetrade.common.ServerResponse;
 import com.alipay.demo.qrcodetrade.service.IQRCodePayService;
@@ -9,9 +13,12 @@ import com.alipay.demo.trade.config.Configs;
 import com.alipay.demo.trade.model.ExtendParams;
 import com.alipay.demo.trade.model.GoodsDetail;
 import com.alipay.demo.trade.model.builder.AlipayTradePrecreateRequestBuilder;
+import com.alipay.demo.trade.model.builder.AlipayTradeQueryRequestBuilder;
 import com.alipay.demo.trade.model.result.AlipayF2FPrecreateResult;
+import com.alipay.demo.trade.model.result.AlipayF2FQueryResult;
 import com.alipay.demo.trade.service.AlipayTradeService;
 import com.alipay.demo.trade.service.impl.AlipayTradeServiceImpl;
+import com.alipay.demo.trade.utils.Utils;
 import com.alipay.demo.trade.utils.ZxingUtils;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
@@ -31,6 +38,19 @@ public class qRCodePayServiceImpl implements IQRCodePayService {
 
     private static final Logger logger = LoggerFactory.getLogger(qRCodePayServiceImpl.class);
 
+    // 支付宝当面付2.0服务
+    private static AlipayTradeService   tradeService;
+    static {
+        /** 一定要在创建AlipayTradeService之前调用Configs.init()设置默认参数
+         *  Configs会读取classpath下的zfbinfo.properties文件配置信息，如果找不到该文件则确认该文件是否在classpath目录
+         */
+        Configs.init("zfbinfo.properties");
+
+        /** 使用Configs提供的默认参数
+         *  AlipayTradeService可以使用单例或者为静态成员对象，不需要反复new
+         */
+        tradeService = new AlipayTradeServiceImpl.ClientBuilder().build();
+    }
     /**
      * 付款逻辑
      *
@@ -99,17 +119,6 @@ public class qRCodePayServiceImpl implements IQRCodePayService {
                 .setTimeoutExpress(timeoutExpress)
                 .setNotifyUrl(PropertiesUtil.getProperty("alipay.callback.url"))//支付宝服务器主动通知商户服务器里指定的页面http路径,和沙箱配置中的授权回调路径一致
                 .setGoodsDetailList(goodsDetailList);
-
-        /** 一定要在创建AlipayTradeService之前调用Configs.init()设置默认参数
-         *  Configs会读取classpath下的zfbinfo.properties文件配置信息，如果找不到该文件则确认该文件是否在classpath目录
-         */
-        Configs.init("zfbinfo.properties");
-
-        /** 使用Configs提供的默认参数
-         *  AlipayTradeService可以使用单例或者为静态成员对象，不需要反复new
-         */
-        AlipayTradeService tradeService = new AlipayTradeServiceImpl.ClientBuilder().build();
-
         AlipayF2FPrecreateResult result = tradeService.tradePrecreate(builder);
         switch (result.getTradeStatus()) {
             case SUCCESS:
@@ -150,6 +159,73 @@ public class qRCodePayServiceImpl implements IQRCodePayService {
         }
     }
 
+    public Map<String,String> alipayCallback(Map<String, String[]> requestParams){
+        Map<String,String> resultMap=new HashMap<>();
+        for(Iterator iter = requestParams.keySet().iterator(); iter.hasNext();){
+            String name= (String) iter.next();
+            String[] values=requestParams.get(name);
+            String valueStr="";
+
+            //将key对应的数组中的内容拼接一下，存入map中
+            for(int i=0;i<values.length;i++){
+                valueStr=(i==values.length-1)?valueStr+values[i]:valueStr+values[i]+",";
+            }
+            resultMap.put(name,valueStr);
+        }
+        //打印回调参数
+        logger.info("支付宝回调，sign:{},trade_status:{},参数:{}",resultMap.get("sign"),resultMap.get("trade_status"),resultMap.toString());
+
+        //需要移除sign_type结点
+        resultMap.remove("sign_type");
+        //非常重要，验证回调的正确性，是不是支付宝发的，还要避免重复通知
+        try {
+            boolean alipayRSACheckedV2=AlipaySignature.rsaCheckV2(resultMap,Configs.getAlipayPublicKey(),"utf-8",Configs.getSignType());
+            if(!alipayRSACheckedV2){
+                logger.error("非法请求，验证不通过");
+            }
+        } catch (AlipayApiException e) {
+            logger.error("支付宝验证回调异常",e);
+        }
+        return resultMap;
+    }
+
+    public ServerResponse trade_query(String tradeNo) {
+        // (必填) 商户订单号，通过此商户订单号查询当面付的交易状态
+        String outTradeNo = tradeNo;
+
+        // 创建查询请求builder，设置请求参数
+        AlipayTradeQueryRequestBuilder builder = new AlipayTradeQueryRequestBuilder()
+                .setOutTradeNo(outTradeNo);
+
+        AlipayF2FQueryResult result = tradeService.queryTradeResult(builder);
+        switch (result.getTradeStatus()) {
+            case SUCCESS:
+                logger.info("查询返回该订单支付成功: )");
+
+                AlipayTradeQueryResponse response = result.getResponse();
+                dumpResponse(response);
+
+                logger.info(response.getTradeStatus());
+                if (Utils.isListNotEmpty(response.getFundBillList())) {
+                    for (TradeFundBill bill : response.getFundBillList()) {
+                        logger.info(bill.getFundChannel() + ":" + bill.getAmount());
+                    }
+                }
+                return ServerResponse.createBySuccessMessage("查询返回该订单支付成功");
+
+            case FAILED:
+                logger.error("查询返回该订单支付失败或被关闭!!!");
+                return ServerResponse.createBySuccessMessage("查询返回该订单支付失败或被关闭!!!");
+
+            case UNKNOWN:
+                logger.error("系统异常，订单支付状态未知!!!");
+                return ServerResponse.createBySuccessMessage("系统异常，订单支付状态未知!!!");
+
+            default:
+                logger.error("不支持的交易状态，交易返回异常!!!");
+                return ServerResponse.createBySuccessMessage("不支持的交易状态，交易返回异常!!!");
+        }
+    }
 
     // 简单打印应答
     private void dumpResponse(AlipayResponse response) {
